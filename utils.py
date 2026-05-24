@@ -9,6 +9,9 @@ from matplotlib import animation
 from pathlib import Path
 import SimpleITK as sitk
 from IPython.display import Image, display
+import torch
+from huggingface_hub import snapshot_download
+from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
 
 #  Paths 
 DATA_DIR = Path("Data/FORISI")
@@ -160,42 +163,6 @@ def save_gif_three_planes(pet_4d, voxel_spacing=(1.0, 1.0, 1.0), cmap="hot",
     print(f"GIF saved to {output_path}")
     plt.close()
 
-
-def save_gif_rotating_mip(volume, voxel_spacing=(1.0, 1.0, 1.0),
-                           output_path="outputs/mip_rotating.gif",
-                           cmap="bone", n_angles=36, interval=80):
-    """
-    GIF of rotating MIP on the coronal-sagittal plane.
-    Rotation is around the Z-axis (axial), projecting along Y (sagittal view)
-    Aspect ratio corrected using physical voxel spacing.
-    """
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    dz, dy, dx = voxel_spacing
-
-    img_min = np.amin(volume)
-    img_max = np.amax(volume)
-    cm = matplotlib.colormaps[cmap]
-
-    fig, ax = plt.subplots(figsize=(6, 8))
-    ax.axis("off")
-    frames = []
-
-    for alpha in np.linspace(0, 360 * (n_angles - 1) / n_angles, num=n_angles):
-        rotated = rotate_on_axial_plane(volume, alpha)
-        # MIP along axis=2 (X) gives coronal-like projection; axis=1 gives sagittal-like
-        # Rotating then projecting along axis=1 sweeps coronal->sagittal->coronal
-        projection = MIP_coronal_plane(rotated)  # coronal-sagittal sweep
-        norm = matplotlib.colors.Normalize(vmin=img_min, vmax=img_max)
-        f = ax.imshow(projection, cmap=cm, norm=norm, aspect=dz/dx, animated=True)
-        title = ax.set_title(f"MIP — {alpha:.0f}°", animated=True)
-        frames.append([f, title])
-
-    anim = animation.ArtistAnimation(fig, frames, interval=interval, blit=False)
-    anim.save(output_path, writer='pillow')
-    print(f"GIF saved to {output_path}")
-    plt.close()
-
-
 # =============================================================================
 # COREGISTRATION using SimpleITK 
 # =============================================================================
@@ -206,14 +173,14 @@ def volume_to_sitk(volume, voxel_spacing):
     voxel_spacing: (dz, dy, dx) in mm
     SimpleITK expects spacing as (dx, dy, dz)
     """
-    import SimpleITK as sitk
+    
     dz, dy, dx = voxel_spacing
     img = sitk.GetImageFromArray(volume.astype(np.float32))
     img.SetSpacing((dx, dy, dz))   # SimpleITK: (x, y, z) order
     return img
 
 def sitk_to_volume(sitk_img):
-    """Convert SimpleITK image back to numpy array."""
+    """Convert SimpleITK image back to numpy array"""
 
     return sitk.GetArrayFromImage(sitk_img).astype(np.float32)
 
@@ -337,6 +304,25 @@ def print_transform_params(transform):
 # QUANTITATIVE EVALUATION of coregistration
 # =============================================================================
 
+# normalize to [0,1]
+def norm01(v):
+        v = v.astype(np.float64)
+        return (v - v.min()) / (v.max() - v.min() + 1e-10)
+
+def mutual_information(a, b, bins=64):
+        hist2d, _, _ = np.histogram2d(a.ravel(), b.ravel(), bins=bins)
+        p_xy = hist2d / hist2d.sum()
+        p_x  = p_xy.sum(axis=1, keepdims=True)
+        p_y  = p_xy.sum(axis=0, keepdims=True)
+        mask = p_xy > 0
+        mi   = np.sum(p_xy[mask] * np.log(p_xy[mask] / (p_x * p_y + 1e-10)[mask]))
+        return mi
+
+def normalized_cross_correlation(a, b):
+    a = a - a.mean(); b = b - b.mean()
+    denom = np.sqrt(np.sum(a**2) * np.sum(b**2))
+    return np.sum(a * b) / (denom + 1e-10)
+
 def evaluate_coregistration(mr_volume, pet_before, pet_after,
                              mr_spacing, pet_spacing):
     """
@@ -351,28 +337,9 @@ def evaluate_coregistration(mr_volume, pet_before, pet_after,
     zoom_factors = [mr_volume.shape[i] / pet_before.shape[i] for i in range(3)]
     pet_before_resampled = scipy.ndimage.zoom(pet_before, zoom_factors, order=1)
 
-    # normalize to [0,1]
-    def norm01(v):
-        v = v.astype(np.float64)
-        return (v - v.min()) / (v.max() - v.min() + 1e-10)
-
     mr_n  = norm01(mr_volume)
     pb_n  = norm01(pet_before_resampled)
     pa_n  = norm01(pet_after)
-
-    def mutual_information(a, b, bins=64):
-        hist2d, _, _ = np.histogram2d(a.ravel(), b.ravel(), bins=bins)
-        p_xy = hist2d / hist2d.sum()
-        p_x  = p_xy.sum(axis=1, keepdims=True)
-        p_y  = p_xy.sum(axis=0, keepdims=True)
-        mask = p_xy > 0
-        mi   = np.sum(p_xy[mask] * np.log(p_xy[mask] / (p_x * p_y + 1e-10)[mask]))
-        return mi
-
-    def normalized_cross_correlation(a, b):
-        a = a - a.mean(); b = b - b.mean()
-        denom = np.sqrt(np.sum(a**2) * np.sum(b**2))
-        return np.sum(a * b) / (denom + 1e-10)
 
     mi_before  = mutual_information(mr_n, pb_n)
     mi_after   = mutual_information(mr_n, pa_n)
@@ -439,7 +406,7 @@ def show_three_planes_fusion(vol_ref, vol_inp, voxel_spacing=(1,1,1), alpha=0.3,
                               cmap_ref='bone', cmap_inp='hot', title="MR + PET Fusion"):
     """
     Alpha fusion in 3 median planes.
-    Both volumes must already be in the same physical space (after coregistration).
+    Both volumes are in the same physical space.
     """
     vol_ref_iso = interpolate_to_isotropic(vol_ref, voxel_spacing)
     vol_inp_iso = interpolate_to_isotropic(vol_inp, voxel_spacing)
@@ -477,13 +444,7 @@ def save_gif_alpha_fusion_mip(volume_ref, volume_inp,
                                n_angles=36, interval=100, alpha=0.3):
     """
     GIF of rotating MIP with alpha fusion of reference + registered input.
-    
-    Both volumes are in the same physical space after coregistration.
-    The GIF shows:
-      - Left panel:  MR MIP (reference)
-      - Middle panel: PET MIP (coregistered)
-      - Right panel:  Alpha fusion
-    
+ 
     Params
     ----------
     ref_spacing : (dz,dy,dx) of reference (MR), used to set aspect ratio
@@ -536,3 +497,367 @@ def save_gif_alpha_fusion_mip(volume_ref, volume_inp,
     print(f"GIF saved to {output_path}")
     plt.close()
 
+
+# =============================================================================
+# nnInteractive SEGMENTATION
+# =============================================================================
+
+def segment_with_nninteractive(mr_volume, bbox_xy, bbox_slice_z, axis='z',
+                                model_dir=None, download_dir="Data/models",
+                                device='cuda', verbose=True):
+    """
+    3D semi-automatic tumor segmentation using nnInteractive.
+
+    The model accepts a 2D bounding box on ONE slice and propagates the
+    segmentation through the whole 3D volume via AutoZoom.
+
+    Params
+    ----------
+    mr_volume : np.ndarray (nz, ny, nx)
+        MR volume as returned by pydicom. 
+    bbox_xy : dict with keys of the 2D bbox 'x_min', 'x_max', 'y_min', 'y_max'
+
+    bbox_slice_z : int
+        Index of the slice where the bbox is drawn (the slice where the tumor
+        appears largest).
+    axis : 'z' (default)
+        Which axis the bbox is drawn on. 'z' = axial slice.
+    model_dir : str or None
+        Path to nnInteractive weights folder. If None, the model is downloaded
+        automatically.
+    download_dir : str
+        Where to cache the downloaded model.
+    device : 'cuda' or 'cpu'
+    verbose : bool
+
+    Returns
+    -------
+    mask : np.ndarray (nz, ny, nx), uint8
+        Binary tumor mask, same shape and orientation as the input mr_volume.
+    """
+    # -----------------------------------------------------------------
+    # 1. Download model weights (only the first time)
+    REPO_ID = "nnInteractive/nnInteractive"
+    MODEL_NAME = "nnInteractive_v1.0"
+
+    if model_dir is None:
+        os.makedirs(download_dir, exist_ok=True)
+        if verbose:
+            print(f"Downloading model weights to {download_dir} (only first time)...")
+        snapshot_download(
+            repo_id=REPO_ID,
+            allow_patterns=[f"{MODEL_NAME}/*"],
+            local_dir=download_dir,
+        )
+        model_dir = os.path.join(download_dir, MODEL_NAME)
+
+    # -----------------------------------------------------------------
+    # 2. Create inference session and load model
+    if verbose:
+        print(f"Loading model from: {model_dir}")
+    session = nnInteractiveInferenceSession(
+        device=torch.device(device),
+        use_torch_compile=False,
+        verbose=verbose,
+        torch_n_threads=os.cpu_count(),
+        do_autozoom=True,
+        use_pinned_memory=True,
+    )
+    session.initialize_from_trained_model_folder(model_dir)
+
+    # -----------------------------------------------------------------
+    # 3. Prepare image
+    img_for_model = np.transpose(mr_volume, (2, 1, 0))      # numpy DICOM shape is (Z, Y, X)
+    img_for_model = img_for_model[np.newaxis, ...].astype(np.float32)  # nnInteractive expects (1, X, Y, Z) 
+
+    if verbose:
+        print(f"Original MR shape (Z,Y,X): {mr_volume.shape}")
+        print(f"Reshaped for nnInteractive (1,X,Y,Z): {img_for_model.shape}")
+
+    session.set_image(img_for_model)
+
+    # Output buffer must be 3D matching (X, Y, Z)
+    target_tensor = torch.zeros(img_for_model.shape[1:], dtype=torch.uint8)
+    session.set_target_buffer(target_tensor)
+
+    # -----------------------------------------------------------------
+    # 4. Build the 2D bounding box prompt
+    #    BBOX format: [[x1, x2], [y1, y2], [z1, z2]]
+    #    For a 2D box on axial slice z, the Z dim is [z, z+1].
+    if axis == 'z':
+        bbox_coords = [
+            [bbox_xy['x_min'], bbox_xy['x_max']],
+            [bbox_xy['y_min'], bbox_xy['y_max']],
+            [bbox_slice_z, bbox_slice_z + 1],
+        ]
+    else:
+        raise NotImplementedError("Only axis='z' (axial) is implemented.")
+
+    if verbose:
+        print(f"Bbox (x,y,z order): {bbox_coords}")
+
+    session.add_bbox_interaction(bbox_coords, include_interaction=True)
+
+    # -----------------------------------------------------------------
+    # 5. Retrieve mask and reshape back to (Z, Y, X)
+    mask_xyz = session.target_buffer.clone().cpu().numpy().astype(np.uint8)
+    mask = np.transpose(mask_xyz, (2, 1, 0))     # back to (Z, Y, X)
+
+    if verbose:
+        n_vox = mask.sum()
+        print(f"\nDone. Voxels in mask: {n_vox}")
+
+    # Free GPU memory
+    session.reset_interactions()
+    del session
+    torch.cuda.empty_cache()
+
+    return mask
+# =============================================================================
+# SEGMENTATION VISUALIZATION & EVALUATION
+# =============================================================================
+
+def show_mask_overlay(volume, mask, slice_idx=None, axes=('axial', 'coronal', 'sagittal'),
+                      cmap_volume='bone', mask_color=(1, 0, 0), alpha=0.4,
+                      voxel_spacing=(1.0, 1.0, 1.0), title=""):
+    """
+    Show the volume with the segmentation mask overlaid as a colored layer.
+
+    If slice_idx is None, uses the slice with the largest mask cross-section
+    for each plane (the "most informative" slice).
+
+    Params
+    ------
+    volume : np.ndarray (nz, ny, nx)
+    mask : np.ndarray (nz, ny, nx) — binary or {0, 1}
+    slice_idx : dict {'axial': int, 'coronal': int, 'sagittal': int} or None
+    axes : tuple of planes to show
+    voxel_spacing : (dz, dy, dx) for aspect ratio correction
+    """
+    dz, dy, dx = voxel_spacing
+
+    # Find the slice with the largest tumor area on each plane
+    if slice_idx is None:
+        slice_idx = {
+            'axial':    int(np.argmax(mask.sum(axis=(1, 2)))),
+            'coronal':  int(np.argmax(mask.sum(axis=(0, 2)))),
+            'sagittal': int(np.argmax(mask.sum(axis=(0, 1)))),
+        }
+
+    fig, ax_list = plt.subplots(1, len(axes), figsize=(5 * len(axes), 5))
+    if len(axes) == 1:
+        ax_list = [ax_list]
+    fig.suptitle(title or "Tumor mask overlay")
+
+    for ax, plane in zip(ax_list, axes):
+        if plane == 'axial':
+            img_slice = volume[slice_idx['axial']]
+            msk_slice = mask[slice_idx['axial']]
+            aspect = dy / dx
+        elif plane == 'coronal':
+            img_slice = np.flipud(volume[:, slice_idx['coronal'], :])
+            msk_slice = np.flipud(mask[:, slice_idx['coronal'], :])
+            aspect = dz / dx
+        elif plane == 'sagittal':
+            img_slice = np.flipud(volume[:, :, slice_idx['sagittal']])
+            msk_slice = np.flipud(mask[:, :, slice_idx['sagittal']])
+            aspect = dz / dy
+        else:
+            raise ValueError(f"Unknown plane: {plane}")
+
+        # Background
+        ax.imshow(img_slice, cmap=cmap_volume, aspect=aspect)
+
+        # Mask as colored overlay (transparent where mask == 0)
+        rgba = np.zeros((*msk_slice.shape, 4))
+        rgba[..., 0] = mask_color[0]
+        rgba[..., 1] = mask_color[1]
+        rgba[..., 2] = mask_color[2]
+        rgba[..., 3] = msk_slice * alpha
+        ax.imshow(rgba, aspect=aspect)
+
+        ax.set_title(f"{plane.capitalize()} (slice {slice_idx[plane]})")
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def tumor_geometric_measures(mask, voxel_spacing):
+    """
+    Compute geometric measures of the segmented tumor.
+
+    Params
+    ------
+    mask : np.ndarray (nz, ny, nx), binary
+    voxel_spacing : (dz, dy, dx) in mm
+
+    Returns
+    -------
+    dict with: n_voxels, volume_mm3, volume_cm3, voxel_volume_mm3,
+               bbox_voxel, bbox_mm, extent_mm
+    """
+    dz, dy, dx = voxel_spacing
+    voxel_vol = dx * dy * dz  # mm cubic
+
+    n_vox = int(mask.sum())
+    coords = np.array(np.where(mask > 0))
+
+    if n_vox == 0:
+        return {'n_voxels': 0, 'volume_mm3': 0.0}
+
+    z_min, y_min, x_min = coords.min(axis=1)
+    z_max, y_max, x_max = coords.max(axis=1)
+
+    extent_mm = (
+        (z_max - z_min + 1) * dz,
+        (y_max - y_min + 1) * dy,
+        (x_max - x_min + 1) * dx,
+    )
+
+    return {
+        'n_voxels': n_vox,
+        'volume_mm3': n_vox * voxel_vol,
+        'volume_cm3': n_vox * voxel_vol / 1000.0,
+        'voxel_volume_mm3': voxel_vol,
+        'bbox_voxel': {
+            'z': (int(z_min), int(z_max)),
+            'y': (int(y_min), int(y_max)),
+            'x': (int(x_min), int(x_max)),
+        },
+        'extent_mm': {
+            'z': extent_mm[0],
+            'y': extent_mm[1],
+            'x': extent_mm[2],
+        },
+    }
+
+
+def tumor_photometric_measures(volume, mask):
+    """
+    Compute photometric measures of the tumor (intensity statistics inside mask).
+    """
+    vals = volume[mask > 0]
+    if len(vals) == 0:
+        return {}
+    return {
+        'mean':   float(np.mean(vals)),
+        'median': float(np.median(vals)),
+        'std':    float(np.std(vals)),
+        'min':    float(np.min(vals)),
+        'max':    float(np.max(vals)),
+        'p95':    float(np.percentile(vals, 95)),
+        'p99':    float(np.percentile(vals, 99)),
+    }
+
+# =============================================================================
+# PET CALIBRATION (raw to kBq/cc)
+# =============================================================================
+
+def get_pet_rescale_factor(pet_dcm):
+    """
+    Extract the real-world value mapping (slope, intercept) from a PET DICOM.
+
+    Modern multi-frame PET stores the calibration inside the
+    RealWorldValueMappingSequence rather than the classic RescaleSlope /
+    RescaleIntercept top-level tags.
+
+    Returns
+    -------
+    slope, intercept : float, float
+        Such that:   value_BqmL = pixel_raw * slope + intercept
+        Assumes Units == 'BQML' (Bq per mL).
+    """
+    if 'RealWorldValueMappingSequence' in pet_dcm:
+        rwvm = pet_dcm.RealWorldValueMappingSequence[0]
+        slope = float(rwvm.RealWorldValueSlope)
+        intercept = float(rwvm.get('RealWorldValueIntercept', 0.0))
+    elif hasattr(pet_dcm, 'RescaleSlope'):
+        slope = float(pet_dcm.RescaleSlope)
+        intercept = float(pet_dcm.get('RescaleIntercept', 0.0))
+    else:
+        raise ValueError("Could not find PET calibration factors in DICOM headers.")
+
+    # Sanity check: ensure Units are Bq/mL
+    units = pet_dcm.get('Units', None)
+    if units is not None and units != 'BQML':
+        print(f"WARNING: PET Units is '{units}', expected 'BQML'. "
+              f"Output may not be in Bq/mL.")
+
+    return slope, intercept
+
+
+def pet_to_kbq_cc(pet_raw, pet_dcm):
+    """
+    Convert raw PET pixel values to kBq/cc (= kBq/mL).
+
+    Params
+    ------
+    pet_raw : np.ndarray
+        Raw pixel values from the PET DICOM (any shape).
+    pet_dcm : pydicom Dataset
+        Source DICOM, used to read the calibration factors.
+
+    Returns
+    -------
+    pet_kbq_cc : np.ndarray, float32
+        Same shape as pet_raw, in kBq/cc.
+    """
+    slope, intercept = get_pet_rescale_factor(pet_dcm)
+    pet_bq_ml = pet_raw.astype(np.float32) * slope + intercept
+    pet_kbq_cc = pet_bq_ml / 1000.0
+    return pet_kbq_cc
+
+def save_gif_rotating_mip_with_mask(volume, mask, voxel_spacing=(1.0, 1.0, 1.0),
+                                     output_path="outputs/mip_rotating_mask.gif",
+                                     cmap="bone", mask_color=(1, 0, 0),
+                                     mask_alpha=0.45, n_angles=36, interval=80):
+    """
+    Rotating MIP with the tumour mask silhouette overlaid.
+
+    For each rotation angle:
+      - rotate both volume and mask around the axial axis
+      - compute MIP of the volume (max along axis 1 -> coronal-sagittal sweep)
+      - compute silhouette of the mask the same way (max projection)
+      - overlay the silhouette as a coloured semi-transparent layer
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    dz, dy, dx = voxel_spacing
+
+    vmin, vmax = np.amin(volume), np.amax(volume)
+    cm = matplotlib.colormaps[cmap]
+
+    fig, ax = plt.subplots(figsize=(6, 8))
+    ax.axis("off")
+    frames = []
+
+    for angle in np.linspace(0, 360 * (n_angles - 1) / n_angles, num=n_angles):
+        rotated_vol  = rotate_on_axial_plane(volume, angle)
+        rotated_mask = rotate_on_axial_plane(mask.astype(np.float32), angle)
+
+        # MIP of the volume (background)
+        mip_vol  = MIP_coronal_plane(rotated_vol)
+        # Silhouette of the mask (overlay)
+        mip_mask = MIP_coronal_plane(rotated_mask)
+        mip_mask = (mip_mask > 0.3).astype(np.float32)   # crisp silhouette
+
+        # Render background
+        norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+        bg = ax.imshow(mip_vol, cmap=cm, norm=norm,
+                       aspect=dz / dx, animated=True)
+
+        # Render mask silhouette as a coloured rgba layer
+        rgba = np.zeros((*mip_mask.shape, 4))
+        rgba[..., 0] = mask_color[0]
+        rgba[..., 1] = mask_color[1]
+        rgba[..., 2] = mask_color[2]
+        rgba[...,  3] = mip_mask * mask_alpha
+        ov = ax.imshow(rgba, aspect=dz / dx, animated=True)
+
+        title = ax.set_title(f"MIP + mask", animated=True)
+        frames.append([bg, ov, title])
+
+    anim = animation.ArtistAnimation(fig, frames, interval=interval, blit=False)
+    anim.save(output_path, writer='pillow')
+    print(f"GIF saved to {output_path}")
+    plt.close()
